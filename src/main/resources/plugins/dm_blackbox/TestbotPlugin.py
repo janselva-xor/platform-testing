@@ -17,6 +17,9 @@ Purpose:      Blackbox test for the Deployment manager
 
 """
 
+import json
+import sys
+import re
 import time
 import argparse
 import eventlet
@@ -24,6 +27,12 @@ import requests
 
 from pnda_plugin import PndaPlugin
 from pnda_plugin import Event
+
+from requests.exceptions import ConnectionError
+from requests.exceptions import HTTPError
+from requests.exceptions import Timeout
+from requests.exceptions import TooManyRedirects
+from requests.exceptions import RequestException
 
 TIMESTAMP_MILLIS = lambda: int(round(time.time() * 1000))
 
@@ -47,6 +56,13 @@ class DMBlackBox(PndaPlugin):
 
         return parser.parse_args(args)
 
+    @staticmethod
+    def extract_title_from_html_response(html_str):
+        title_tag = re.search('<title>(.+?)<.*/title>', html_str)
+        if title_tag:
+            cause_msg = re.sub('<[A-Za-z\/][^>]*>', '', title_tag.group())
+            return cause_msg
+        return html_str
 
     def runner(self, args, display=True):
         '''
@@ -57,14 +73,31 @@ class DMBlackBox(PndaPlugin):
         else ""
 
         options = self.read_args(plugin_args)
-
+        cause = None
         values = []
+
+        packages_available_ok, packages_deployed_ok = False, False
+        packages_available_count, packages_deployed_count = -1, -1
 
         try:
             start = TIMESTAMP_MILLIS()
             with eventlet.Timeout(100):
                 req = requests.get("%s/repository/packages" % (options.dmendpoint), timeout=20)
             end = TIMESTAMP_MILLIS()
+
+            if req.status_code in [500, 404, 400, 409]:
+                if req.status_code == 500:
+                    try:
+                        json_obj = json.loads(req.text)
+                        info_str = json_obj.get('information', 'Not Available')
+                        cause = DMBlackBox.extract_title_from_html_response(info_str)
+                        raise RequestException
+                    except ValueError:
+                        pass
+
+                cause = DMBlackBox.extract_title_from_html_response(req.text)
+                raise RequestException
+
             packages_available_ok = True
             packages_available_count = len(req.json())
             packages_available_ms = end-start
@@ -74,11 +107,23 @@ class DMBlackBox(PndaPlugin):
             values.append(Event(TIMESTAMP_MILLIS(), "deployment-manager", \
                 "deployment-manager.packages_available_count", \
                 [], packages_available_count))
+
+        except (ConnectionError, HTTPError, Timeout, TooManyRedirects):
+            cause = 'Unable to connect to the Deployment Server'
+
+        except RequestException:
+            pass
+
         except Exception:
-            packages_available_ok = False
+            cause = 'Exception - ' + str(sys.exc_info()[0])
+
         values.append(Event(TIMESTAMP_MILLIS(), "deployment-manager", \
             "deployment-manager.packages_available_succeeded", \
             [], packages_available_ok))
+
+        values.append(Event(TIMESTAMP_MILLIS(), "deployment-manager", \
+                            "deployment-manager.packages_available_count", \
+                            [], packages_available_count))
 
         try:
             start = TIMESTAMP_MILLIS()
@@ -86,6 +131,20 @@ class DMBlackBox(PndaPlugin):
                 req = requests.get("%s/packages" \
                     % (options.dmendpoint), timeout=20)
             end = TIMESTAMP_MILLIS()
+
+            if req.status_code in [500, 404, 400, 409]:
+                if req.status_code == 500:
+                    try:
+                        json_obj = json.loads(req.text)
+                        info_str = json_obj.get('information', 'Not Available')
+                        cause = DMBlackBox.extract_title_from_html_response(info_str)
+                        raise RequestException
+                    except ValueError:
+                        pass
+
+                cause = DMBlackBox.extract_title_from_html_response(req.text)
+                raise RequestException
+
             packages_deployed_ok = True
             packages_deployed_count = len(req.json())
             packages_deployed_ms = end-start
@@ -95,16 +154,28 @@ class DMBlackBox(PndaPlugin):
             values.append(Event(TIMESTAMP_MILLIS(), 'deployment-manager', \
                 "deployment-manager.packages_deployed_count", \
                 [], packages_deployed_count))
+
+        except (ConnectionError, HTTPError, Timeout, TooManyRedirects):
+            cause = 'Unable to connect to the Deployment Server'
+
+        except RequestException:
+            pass
+
         except Exception:
-            packages_deployed_ok = False
+            cause = 'Exception - ' + str(sys.exc_info()[0])
+
         values.append(Event(TIMESTAMP_MILLIS(), 'deployment-manager', \
             "deployment-manager.packages_deployed_succeeded", \
             [], packages_deployed_ok))
-        cause = ""
+
+        values.append(Event(TIMESTAMP_MILLIS(), 'deployment-manager', \
+                            "deployment-manager.packages_deployed_count", \
+                            [], packages_deployed_count))
+
         health = "OK"
         if not packages_available_ok or not packages_deployed_ok:
             health = "ERROR"
-            cause = "Deployment manager package APIs are not working"
+
         values.append(Event(TIMESTAMP_MILLIS(), 'deployment-manager',
                             'deployment-manager.health', [cause], health))
         if display:
